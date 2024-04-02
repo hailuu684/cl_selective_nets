@@ -12,7 +12,7 @@ import torch.optim as optim
 import time
 from train_epoch import train, test
 from randomaug import RandAugment
-from cl_strategy import LearningToPromptWithDistilled, DynamicIntegrated, DynamicIntegratedSubnets
+from cl_strategy import LearningToPromptWithDistilled, DynamicIntegrated, DynamicIntegratedSubnets, DynamicIntegratedSubnetsTaskPredictive
 
 
 def run_cl_strategy():
@@ -32,7 +32,7 @@ def run_cl_strategy():
     parser.add_argument('--lamb_af', default=1e-8, type=float)
 
     # Model parameters
-    parser.add_argument('--lr', default=1e-4, type=float, help='learning rate')  # resnets.. 1e-3, Vit..1e-4
+    parser.add_argument('--lr', default=1e-2, type=float, help='learning rate')  # resnets.. 1e-3, Vit..1e-4
     parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
     parser.add_argument('--aug', default=True, type=bool, help='use randomaug')
     parser.add_argument('--noamp', action='store_true',
@@ -116,7 +116,9 @@ def run_cl_strategy():
         raise Exception("Choose image size 32 or 128")
 
     # Load real dataset
-    cl_core50 = core50.load_core50(args=args, scenario=args.scenario, mini=mini, obj_lvl=False,
+    # let the scenario='ni' is because we will split dataset into nc or ni later in the strategy code
+    # avalanche doesn't support to split into how many experiences we want, so we need to separate later
+    cl_core50 = core50.load_core50(args=args, scenario='ni', mini=mini, obj_lvl=False,
                                    dataset_root='/home/luu/DistilledDataset_ContinualLearning/core50/avalanche_core50')
 
     # Load distilled dataset
@@ -130,6 +132,9 @@ def run_cl_strategy():
         DynamicIntegrated.DICL(args=args, real_dataset=cl_core50, distilled_dataset=distilled_datasets)
     elif args.cl_strategy == 'DIWSN':
         DynamicIntegratedSubnets.DIWSN(args=args, real_dataset=cl_core50, distilled_dataset=distilled_datasets)
+    elif args.cl_strategy == 'DI_with_task_predictive':
+        DynamicIntegratedSubnetsTaskPredictive.DIWSN_task_predictive(args=args, real_dataset=cl_core50,
+                                                                     distilled_dataset=distilled_datasets)
     else:
         raise NotImplemented("Strategy is not implemented yet")
 

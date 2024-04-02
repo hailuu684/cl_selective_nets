@@ -1,26 +1,3 @@
-"""
-The technique referring to is often employed in the context of Open Set Recognition (OSR) within deep learning.
-Open Set Recognition is a challenge that seeks to enable models not only to classify seen (known) classes accurately but
-also to reject samples from unseen (unknown) classes that weren't available during the training phase.
-
-In typical classification tasks, the class with the highest probability is chosen as the prediction. However, in the
-context of OSR, a simple maximum probability threshold might not be sufficient because unknown class samples could still
-produce a high probability for one of the known classes, leading to misclassification.
-
- It has been observed that when a neural network is presented with an unknown sample (i.e., a sample from a class not
- seen during training), the Softmax probabilities tend to be more uniformly distributed across the classes.
- In other words, the network is "unsure" and doesn't strongly favor any particular known class. By thresholding on these
- Softmax scores, one can reject samples for which the network does not produce a sufficiently high probability for any
- single class
-
- Open set can recognize the images that belong to the model that it belongs to
- https://github.com/shrtCKT/opennet/blob/master/opennet/opennet.py#L248
- https://epubs.siam.org/doi/pdf/10.1137/1.9781611976236.18
-
- If the image is not from trained distribution, return None
- https://colab.research.google.com/github/muellerzr/Practical-Deep-Learning-for-Coders-2.0/blob/master/Computer%20Vision/03_Unknown_Labels.ipynb#scrollTo=yooLCETW-jKz
-"""
-
 # https://github.com/lywang3081/CAF/blob/v1.0.0/networks/conv_net_caf.py
 # AdaptCL: https://arxiv.org/pdf/2207.11005.pdf
 import copy
@@ -61,7 +38,7 @@ except ImportError:
 import sys
 
 sys.path.append("../")
-from models import vit, vit_prompt, resnet
+from models import vit, vit_prompt, resnet, simple_cnn, AE
 from train_epoch import train, test
 from randomaug import RandAugment
 from utils import progress_bar
@@ -80,8 +57,6 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
                                                                             train_mb_size=32, eval_mb_size=32, **kwargs)
         self.fisher_matrices = None
         self.prev_task_params = {}
-
-        self.kld = KLD()
         self.adapt_af = True
         self.adap_kld = True
 
@@ -190,13 +165,13 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         total_loss = []
         total_acc = []
 
-        for batch_idx, (images, targets) in enumerate(stream_dataloader):
+        for batch_idx, (images, targets, _) in enumerate(stream_dataloader):
             # self.model.to(self.args.device)
             images = images.to(self.args.device)
             targets = targets.to(self.args.device)
 
             # Given task_id=u for debugging
-            outputs = self.model(images, task_id=None, mode='eval_task_agnostic')
+            best_net_id, outputs = self.model(images, task_id=None)
 
             loss = self.cross_entropy(outputs, targets)
 
@@ -217,100 +192,50 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
 
         print('Average accuracy={:5.1f}%'.format(test_acc))
 
-        output_path = '/home/luu/projects/cl_selective_nets/results/core50_DISN_task-agnostic_softmax-thresholding.txt'
+        output_path = '/home/luu/projects/cl_selective_nets/results/core50_DISN_task-agnostic_reconstruction_score.txt'
         print('Save at ' + output_path)
         np.savetxt(output_path, self.acc, '%.4f')
-
-    def eval(self, exp_list, **kwargs):
-        self.model.eval()
-        all_stream_dataset = self.eval_all_stream_dataset[:self.task_id + 1]
-
-        for u, test_stream in enumerate(all_stream_dataset):
-            print(f"<< Testing on task {u} >>")
-            stream_dataloader = DataLoader(test_stream.dataset,
-                                           batch_size=self.train_mb_size, shuffle=False,
-                                           pin_memory=True, num_workers=6, collate_fn=self.collate_fn)
-
-            test_loss = 0
-            correct = 0
-            total = 0
-
-            total_loss = []
-            total_acc = []
-
-            for batch_idx, (images, targets) in enumerate(stream_dataloader):
-
-                # self.model.to(self.args.device)
-                images = images.to(self.args.device)
-                targets = targets.to(self.args.device)
-
-                # Given task_id=u for debugging
-                outputs = self.model(images, task_id=None, mode='eval_upto_current_task')
-
-                loss = self.cross_entropy(outputs, targets)
-
-                test_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-
-                total_loss.append(test_loss / (batch_idx + 1))
-                total_acc.append(100. * correct / total)
-
-                progress_bar(batch_idx, len(stream_dataloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                             % (test_loss / (batch_idx + 1), 100. * correct / total, correct, total))
-
-            test_loss, test_acc = np.average(total_loss), np.average(total_acc)
-            self.acc[self.task_id, u] = test_acc
-            self.lss[self.task_id, u] = test_loss
-
-        acc = np.mean(self.acc[self.task_id, :self.task_id + 1])
-        print('Average accuracy={:5.1f}%'.format(acc))
-
-        output_path = '/home/luu/projects/cl_selective_nets/results/core50_DISN_upto_current_task.txt'
-        print('Save at ' + output_path)
-        np.savetxt(output_path, self.acc, '%.4f')
-
-    def train_k_mean(self):
-        pass
 
     def train_current_task(self, args, model, trainloader, epoch):
         print('\nEpoch: %d' % epoch)
         model.train()
-        train_loss = 0
+        train_ce_loss = 0
+        train_reconstruction_loss = 0
         correct = 0
         total = 0
         for batch_idx, data in enumerate(trainloader):
-            try:
-                inputs, targets, _ = data
-            except:
-                inputs, targets = data
+            inputs, targets, taskid_targets = data
 
             inputs, targets = inputs.to(args.device), targets.to(args.device)
 
             # Forward current model
-            task = torch.autograd.Variable(torch.LongTensor([self.task_id]).cuda())
-            outputs = self.model(inputs, task, mode='train')
+            # print(taskid_targets)
+            reconstructed_img, outputs = self.model(inputs, task_id=taskid_targets[0])
 
-            # Store the features from the current task, only get the features from the last epoch
-            # todo: get features from distilled images
-            if len(self.stored_features[self.task_id]) <= 100 and epoch == self.args.n_epochs - 1:
-                self.stored_features[self.task_id].append(outputs)
+            ce_loss = self.cross_entropy(outputs, targets)
 
-            loss = self.cross_entropy(outputs, targets)
+            reconstruction_loss = F.mse_loss(inputs, reconstructed_img, reduction="none")
+            reconstruction_loss = reconstruction_loss.sum(dim=[1, 2, 3]).mean(dim=[0])
+
+            total_loss = reconstruction_loss + ce_loss
+
             # print('loss = ', modified_ce_loss)
             # Backward
             self.optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             self.optimizer.step()
 
-            train_loss += loss.item()
+            train_ce_loss += ce_loss.item()
+            train_reconstruction_loss += reconstruction_loss.item()
+
+            # Accuracy
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            progress_bar(batch_idx, len(trainloader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (train_loss / (batch_idx + 1), 100. * correct / total, correct, total))
+            progress_bar(batch_idx, len(trainloader), 'CE Loss: %.3f | Reconstruction Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                         % (train_ce_loss / (batch_idx + 1), train_reconstruction_loss / (batch_idx + 1),
+                            100. * correct / total, correct, total))
 
     def eval_current_task(self, args, model, val_loader, test_task_id=None):
         model.eval()
@@ -340,7 +265,7 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
                 task = torch.autograd.Variable(torch.LongTensor([current_task]).cuda())
 
                 # Original code, not have return task id
-                outputs = self.model(inputs, task)
+                _, outputs = self.model(inputs, task)
 
                 # # Trying to make task ID predictions
                 # pred_taskid, outputs = self.model(inputs, task, return_experts=False, return_task_pred=True)
@@ -355,7 +280,7 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
                 total_loss.append(test_loss / (batch_idx + 1))
                 total_acc.append(100. * correct / total)
 
-                progress_bar(batch_idx, len(val_loader), 'Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                progress_bar(batch_idx, len(val_loader), 'CE Loss: %.3f | Acc: %.3f%% (%d/%d)'
                              % (test_loss / (batch_idx + 1), 100. * correct / total, correct, total))
 
         return np.average(total_loss), np.average(total_acc)
@@ -405,31 +330,16 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         try:
             images, labels, task_id = zip(*batch)
         except ValueError:
-            images, labels, task_id, _ = zip(*batch)
+            images, labels, _, task_id = zip(*batch)
 
         # print(type(images), len(images))
         images = self.tuple_of_tensors_to_tensor(images)
         labels = torch.tensor(labels)  # Convert labels to tensor
 
-        return images, labels
+        return images, labels, task_id
 
 
-class KLD(nn.Module):
-    def __init__(self):
-        super(KLD, self).__init__()
-        self.criterion_KLD = nn.KLDivLoss(reduction='batchmean')
-
-    def forward(self, x):
-        KLD_loss = 0
-        for k in range(len(x)):
-            for l in range(len(x)):
-                if l != k:
-                    KLD_loss += self.criterion_KLD(F.log_softmax(x[k], dim=1), F.softmax(x[l], dim=1).detach())
-
-        return KLD_loss
-
-
-def DIWSN(args, real_dataset, distilled_dataset):
+def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
     # Get real train, val, and test dataset
     train_dataset, val_dataset, test_dataset = real_dataset
 
@@ -475,9 +385,8 @@ def DIWSN(args, real_dataset, distilled_dataset):
         current_classes = real_experience.classes_in_this_experience
         taskcla.append((task_id, len(current_classes)))
 
-    model = vit.ViTwithSelectiveSubnets(image_size=args.size, patch_size=args.patch, num_classes=10, dim=args.dimhead,
-                                        depth=6, heads=8, mlp_dim=512, dropout=0.1, emb_dropout=0.1,
-                                        num_tasks=args.n_experience)
+    model = AE.AEWithSelectiveSubnets(base_channel_size=args.size, latent_dim=512, num_child_models=args.n_experience,
+                                      num_classes=args.nb_classes, width=args.size, height=args.size)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
@@ -496,26 +405,11 @@ def DIWSN(args, real_dataset, distilled_dataset):
         strategy.eval_agnostic()
 
         # if task_id == 4:
-        #     torch.save(strategy.stored_features, '/home/luu/projects/cl_selective_nets/results/features.pt')
+        #     torch.save(strategy.stored_features, '/home/luu/projects/cl_selective_nets/results/features.pt'
 
-
-def sample_subset(dataset, images_per_class=10):
-    targets = np.array([target for _, target, _ in dataset])
-    classes, class_counts = np.unique(targets, return_counts=True)
-
-    indices_per_class = {class_: np.where(targets == class_)[0] for class_ in classes}
-    sampled_indices = []
-
-    for class_, indices in indices_per_class.items():
-        if len(indices) > images_per_class:
-            sampled_indices.extend(np.random.choice(indices, images_per_class, replace=False))
-        else:
-            sampled_indices.extend(indices)
-
-    return Subset(dataset, sampled_indices)
-
-
+    torch.save(model.state_dict(), '/home/luu/projects/cl_selective_nets/results'
+                                   '/core50_DISN_task-agnostic_reconstruction_score.pt')
 """
-python3 main_cl.py --n_epochs 5 --cl_strategy DIWSN
+python3 main_cl.py --n_epochs 5 --cl_strategy DI_with_task_predictive
 
 """

@@ -243,7 +243,10 @@ class ViTwithSelectiveSubnets(nn.Module):
 
             logits = selected_net(img)
 
-        elif mode == 'eval':
+        # eval_upto_current_task: Means evaluate in a way that all classes in the past up to the current task
+        # Example: current task is 2, classes = (4, 5). Task 0: (0, 1), Task 1: (2, 3). Then number of classes
+        #          available is (0, 1, 2, 3, 4, 5). Not the classes in the future which are 6 -> 9
+        elif mode == 'eval_upto_current_task':
 
             # Note that evaluate each single image, not batch
             outputs = []
@@ -252,14 +255,14 @@ class ViTwithSelectiveSubnets(nn.Module):
             # The idea is that which net produce extreme response to the current images
             for net in self.nets:
 
-                output = net(img)  # Get logits for each subnet, (32, 10)
-                outputs.append(output)
+                output = net(img)  # Get logits for each subnet, (32, 10), 32 is batch_size
+                # outputs.append(output)
 
                 # Use numpy
-                confidence = output.detach().clone().cpu().numpy()
+                output_numpy = output.detach().clone().cpu().numpy()
 
                 # Transforming to probabilities for comparison
-                probs = softmax(confidence, axis=1)
+                probs = softmax(output_numpy, axis=1)  # (32, 10)
 
                 # Sum of probabilities
                 """
@@ -274,7 +277,7 @@ class ViTwithSelectiveSubnets(nn.Module):
                  .
                  .
                 """
-                sum_probs = np.sum(probs, axis=0)
+                sum_probs = np.sum(probs, axis=0)  # (1, 10)
 
                 # Find the maximum response
                 confidences.append(np.max(sum_probs))
@@ -287,6 +290,25 @@ class ViTwithSelectiveSubnets(nn.Module):
 
             logits = selected_net(img)
 
+        # In this task, all classes are available in the beginning
+        elif mode == 'eval_task_agnostic':
+            confidences = []
+
+            for net in self.nets:
+                output = net(img)  # Assuming img is a single image tensor
+                output_numpy = output.detach().cpu().numpy()  # Adjusted for clarity
+
+                # Calculate softmax probabilities for each class
+                probs = softmax(output_numpy, axis=1)  # Ensure correct axis for softmax
+
+                # Take the max probability as the confidence score
+                confidence_score = np.max(probs)
+                confidences.append(confidence_score)
+
+            # Select the model index with the highest confidence score
+            best_model_index = np.argmax(confidences)
+            selected_net = self.nets[int(best_model_index)]
+            logits = selected_net(img)
         else:
             raise Exception("Choose correct mode: Train or eval")
 

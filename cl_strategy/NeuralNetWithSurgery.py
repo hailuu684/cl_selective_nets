@@ -11,6 +11,4 @@ net_0 prediction
 """
 
 
-# Another idea is that encode images, then decode to get back to the image, compare if decoded image == input image,
-# then correct, if not, then unknown
 

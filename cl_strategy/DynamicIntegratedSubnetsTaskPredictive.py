@@ -385,7 +385,9 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
         current_classes = real_experience.classes_in_this_experience
         taskcla.append((task_id, len(current_classes)))
 
-    model = AE.AEWithSelectiveSubnets(base_channel_size=args.size, latent_dim=512, num_child_models=args.n_experience,
+    # latent_dim = 256, 384 (best), 512
+    model = AE.AEWithSelectiveSubnets(base_channel_size=args.size, latent_dim=args.latent_dim,
+                                      num_child_models=args.n_experience,
                                       num_classes=args.nb_classes, width=args.size, height=args.size)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)

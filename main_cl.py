@@ -103,6 +103,8 @@ def run_cl_strategy():
     parser.add_argument('--pull_constraint', default=False)
     parser.add_argument('--pull_constraint_coeff', default=0.5, type=float)
 
+    # Image reconstruction
+    parser.add_argument('--latent_dim', default=384, type=int, help='latent dimension: 128, 256, 384, 512')
     args = parser.parse_args()
 
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'

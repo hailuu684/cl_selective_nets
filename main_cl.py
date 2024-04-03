@@ -18,6 +18,9 @@ from cl_strategy import LearningToPromptWithDistilled, DynamicIntegrated, Dynami
 def run_cl_strategy():
     parser = argparse.ArgumentParser(description='PyTorch CORe50 Training')
 
+    # Dataset settings
+    parser.add_argument('--dataset', default='core50', type=str, help='choose dataset [core50, cifar10]')
+
     # Continual learning parameters
     parser.add_argument('--cl_strategy', default='l2p_distilled', type=str, help='choose cl strategy')
     parser.add_argument('--scenario', default='nc', type=str, help='nc or ni')
@@ -105,6 +108,10 @@ def run_cl_strategy():
 
     # Image reconstruction
     parser.add_argument('--latent_dim', default=384, type=int, help='latent dimension: 128, 256, 384, 512')
+
+    # Wandb
+    parser.add_argument('--use_wandb', default=False, type=bool, help='Use wandb or not')
+
     args = parser.parse_args()
 
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -120,22 +127,31 @@ def run_cl_strategy():
     # Load real dataset
     # let the scenario='ni' is because we will split dataset into nc or ni later in the strategy code
     # avalanche doesn't support to split into how many experiences we want, so we need to separate later
-    cl_core50 = core50.load_core50(args=args, scenario='ni', mini=mini, obj_lvl=False,
-                                   dataset_root='/home/luu/DistilledDataset_ContinualLearning/core50/avalanche_core50')
 
-    # Load distilled dataset
-    distilled_datasets = distilled_core50.get_distilled_core50()
+    if args.dataset == 'core50':
+        dataset_cl = core50.load_core50(args=args, scenario='ni', mini=mini, obj_lvl=False,
+                                       dataset_root='/home/luu/DistilledDataset_ContinualLearning'
+                                                    '/core50/avalanche_core50')
+
+        # Load distilled dataset
+        distilled_datasets = distilled_core50.get_distilled_core50()
+
+    elif args.dataset == 'cifar10':
+        raise NotImplemented("Not implemented yet")
+
+    else:
+        raise NotImplemented(f"The dataset {args.dataset} is not implemented")
 
     # Load cl strategy
     if args.cl_strategy == 'l2p_distilled':
-        LearningToPromptWithDistilled.L2PWithDistilled(args=args, real_dataset=cl_core50,
+        LearningToPromptWithDistilled.L2PWithDistilled(args=args, real_dataset=dataset_cl,
                                                        distilled_dataset=distilled_datasets)
     elif args.cl_strategy == 'DICL':
-        DynamicIntegrated.DICL(args=args, real_dataset=cl_core50, distilled_dataset=distilled_datasets)
+        DynamicIntegrated.DICL(args=args, real_dataset=dataset_cl, distilled_dataset=distilled_datasets)
     elif args.cl_strategy == 'DIWSN':
-        DynamicIntegratedSubnets.DIWSN(args=args, real_dataset=cl_core50, distilled_dataset=distilled_datasets)
+        DynamicIntegratedSubnets.DIWSN(args=args, real_dataset=dataset_cl, distilled_dataset=distilled_datasets)
     elif args.cl_strategy == 'DI_with_task_predictive':
-        DynamicIntegratedSubnetsTaskPredictive.DIWSN_task_predictive(args=args, real_dataset=cl_core50,
+        DynamicIntegratedSubnetsTaskPredictive.DIWSN_task_predictive(args=args, real_dataset=dataset_cl,
                                                                      distilled_dataset=distilled_datasets)
     else:
         raise NotImplemented("Strategy is not implemented yet")

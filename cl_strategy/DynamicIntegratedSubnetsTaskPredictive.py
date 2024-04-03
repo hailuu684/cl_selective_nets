@@ -16,7 +16,7 @@ from torch.utils.data import Subset
 from typing import Iterable
 import torch.optim as optim
 import torch.nn.functional as F
-
+import wandb
 try:
     from timm.models.helpers import (
         adapt_input_conv,
@@ -52,7 +52,7 @@ def _experiences_parameter_as_iterable(experiences):
 
 
 class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
-    def __init__(self, args, model, optimizer, test_entire_dataset, eval_stream, **kwargs):
+    def __init__(self, args, model, optimizer, test_entire_dataset, eval_stream, wandb, **kwargs):
         super(DynamicIntegratedContinualLearningWithSubnets, self).__init__(model=model, optimizer=optimizer,
                                                                             train_mb_size=32, eval_mb_size=32, **kwargs)
         self.fisher_matrices = None
@@ -99,6 +99,15 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         from collections import defaultdict
         self.stored_features = defaultdict(list)
 
+        # use wandb
+        self.wandb = wandb
+        self.ce_loss = 0
+        self.reconstruction_loss = 0
+        self.val_loss = 0
+
+        self.train_acc = 0
+        self.val_acc = 0
+
     def train(self, experiences, task_id=0, **kwargs):
         """
         train phase
@@ -139,8 +148,20 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
             self.train_current_task(self.args, self.model, self.dataloader, epoch)
 
             print("<< Evaluating the current training >> ")
-            self.eval_current_task(self.args, self.model, self.eval_each_stream_dataloader)
+            val_loss, val_acc = self.eval_current_task(self.args, self.model, self.eval_each_stream_dataloader)
 
+            if self.wandb:
+                # Use a unique tag for each experience and epoch combination
+                tag_loss_val = f'Loss/eval_separated_exps_in_one'
+                tag_acc_val = f'Accuracy/eval_separated_exps_in_one'
+                tag_ce_loss_train = f'Loss/ce_loss'
+                tag_reconstruction_loss_train = f'Loss/reconstruction_loss'
+                tag_acc_train = f'Accuracy/train_separated_exps_in_one'
+
+                self.wandb.log({tag_loss_val: val_loss, tag_acc_val: val_acc,
+                                tag_ce_loss_train: self.ce_loss, tag_acc_train: self.train_acc,
+                                tag_reconstruction_loss_train: self.reconstruction_loss,
+                                "epoch": epoch})
         print(f"<< Finish training on task {self.task_id} >>")
         print(" ")
 
@@ -196,6 +217,13 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         print('Save at ' + output_path)
         np.savetxt(output_path, self.acc, '%.4f')
 
+        if self.wandb:
+            tag_val_task_agnostic_loss = 'Agnostic-Loss'
+            tag_val_task_agnostic_acc = 'Agnostic-Acc'
+
+            self.wandb.log({tag_val_task_agnostic_loss: test_loss,
+                            tag_val_task_agnostic_acc: test_acc})
+
     def train_current_task(self, args, model, trainloader, epoch):
         print('\nEpoch: %d' % epoch)
         model.train()
@@ -236,6 +264,10 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
             progress_bar(batch_idx, len(trainloader), 'CE Loss: %.3f | Reconstruction Loss: %.3f | Acc: %.3f%% (%d/%d)'
                          % (train_ce_loss / (batch_idx + 1), train_reconstruction_loss / (batch_idx + 1),
                             100. * correct / total, correct, total))
+
+        self.ce_loss = train_ce_loss / (batch_idx + 1)
+        self.reconstruction_loss = train_reconstruction_loss / (batch_idx + 1)
+        self.train_acc = 100. * correct / total
 
     def eval_current_task(self, args, model, val_loader, test_task_id=None):
         model.eval()
@@ -340,6 +372,28 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
 
 
 def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
+
+    if args.use_wandb is True:
+
+        wandb.login(key='1bed216d1f9c32afa692155d2e0911cd750f41dd')
+
+        config = dict(
+            num_experience=args.n_experience, num_epoch=args.n_epochs, dataset=args.dataset,
+            strategy=args.cl_strategy, scenario=args.scenario, latent_dim=args.latent_dim
+        )
+
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="CL-Subnets-Predictive-Task",
+
+            # track hyperparameters and run metadata
+            config=config,
+
+            name=f"scenario-{args.cl_strategy}" + f'_{args.latent_dim}-latent-dim' + f'_{args.n_epochs}-epochs',
+
+            entity='luutunghai'
+        )
+
     # Get real train, val, and test dataset
     train_dataset, val_dataset, test_dataset = real_dataset
 
@@ -395,7 +449,8 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
     # Get strategy
     strategy = DynamicIntegratedContinualLearningWithSubnets(args=args, model=model, optimizer=optimizer,
                                                              test_entire_dataset=test_dataset,
-                                                             eval_stream=real_dataset_exps.test_stream)
+                                                             eval_stream=real_dataset_exps.test_stream,
+                                                             wandb=wandb if args.use_wandb is True else None)
 
     # print(len(real_dataset_exps.test_stream[0].dataset))
     for task_id, (real_experience, distilled_experience) in enumerate(zip(real_dataset_exps.train_stream,
@@ -411,7 +466,14 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
 
     torch.save(model.state_dict(), '/home/luu/projects/cl_selective_nets/results'
                                    '/core50_DISN_task-agnostic_reconstruction_score.pt')
+
+    if args.use_wandb is True:
+        # [optional] finish the wandb run, necessary in notebooks
+        wandb.finish()
+
 """
 python3 main_cl.py --n_epochs 5 --cl_strategy DI_with_task_predictive
+
+python3 main_cl.py --n_epochs 200 --latent_dim 128 --cl_strategy DI_with_task_predictive --lr 0.001 --use_wandb True
 
 """

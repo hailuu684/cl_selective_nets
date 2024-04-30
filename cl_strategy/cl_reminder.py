@@ -18,6 +18,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import wandb
 import torchvision
+import random
 try:
     from timm.models.helpers import (
         adapt_input_conv,
@@ -38,13 +39,15 @@ except ImportError:
 
 import sys
 from pytorch_msssim import ssim
+
 sys.path.append("../")
-from models import vit, vit_prompt, resnet, simple_cnn, AE, model_utils
+from models import resnet, dinov2, model_utils
 from train_epoch import train, test
 from randomaug import RandAugment
 from utils import progress_bar
-from loss_functions import perceptual_loss
+
 from get_datasets import intel_image
+
 
 def _experiences_parameter_as_iterable(experiences):
     if isinstance(experiences, Iterable):
@@ -53,17 +56,23 @@ def _experiences_parameter_as_iterable(experiences):
         return [experiences]
 
 
-class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
-    def __init__(self, args, model, optimizer, test_entire_dataset, eval_stream, wandb, perceptual_loss_func, **kwargs):
-        super(DynamicIntegratedContinualLearningWithSubnets, self).__init__(model=model, optimizer=optimizer,
-                                                                            train_mb_size=32, eval_mb_size=32, **kwargs)
-        self.fisher_matrices = None
-        self.prev_task_params = {}
-        self.adapt_af = True
-        self.adap_kld = True
+class CL_reminder(SupervisedTemplate):
+    def __init__(self, args, model, optimizer, memories, test_entire_dataset, eval_stream, wandb, k):
+        super(CL_reminder, self).__init__(model=model, optimizer=optimizer, train_mb_size=32, eval_mb_size=32)
 
+        # Memory parameters
+        self.memories = memories
+
+        # Number of images in each label
+        self.k = k
+
+        self.compare_method = 'correlation_based_distance'
+        loguru.logger.info(f"Compare method using: {self.compare_method}")
+
+        # Loss function
         self.cross_entropy = nn.CrossEntropyLoss()
 
+        # Distilled dataset
         self.adapted_distilled_dataset = None
         self.distilled_dataloader = None
         self.distilled_experience = None
@@ -74,6 +83,7 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         self.val_dataset = test_entire_dataset
         self.val_dataloader = None
 
+        # Test each experience
         self.eval_all_stream_dataset = eval_stream
         self.eval_each_stream_dataloader = None
 
@@ -90,31 +100,17 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         # use gpu
         self.model.to(args.device)
 
-        # Loss function
-        self.criterion = nn.CrossEntropyLoss().to(args.device)
-
         # Loop tasks
         self.acc = np.zeros((args.n_experience, args.n_experience), dtype=np.float32)
         self.lss = np.zeros((args.n_experience, args.n_experience), dtype=np.float32)
 
-        # Meta model
-        from collections import defaultdict
-        self.stored_features = defaultdict(list)
-
         # use wandb
         self.wandb = wandb
         self.ce_loss = 0
-        self.reconstruction_loss = 0
         self.val_loss = 0
 
         self.train_acc = 0
         self.val_acc = 0
-
-        # perceptual loss
-        self.perceptual_loss = perceptual_loss_func
-
-        # self.perceptual_loss = perceptual_loss.AE_PerceptualLoss(self.model).to('cuda') if args.device else \
-        #     perceptual_loss.AE_PerceptualLoss(self.model)
 
     def train(self, experiences, task_id=0, **kwargs):
         """
@@ -151,26 +147,10 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
 
         # Early stopping
         early_stopper = model_utils.EarlyStopper(patience=10)
-        #
-        # loguru.logger.info(f"Optimizing classification loss on task {self.task_id}")
-        # early_stopper_classification = model_utils.EarlyStopper(patience=10)
-        # for epoch in range(0, 20):
-        #     self.train_current_task(self.args, self.model, self.dataloader, epoch, optimize='classification')
-        #     print("<< Evaluating the current training >> ")
-        #     val_loss, val_acc, val_rec_loss = self.eval_current_task(self.args, self.model,
-        #                                                              self.eval_each_stream_dataloader)
-        #     print(" ")
-        #     if early_stopper.early_stop(val_acc):
-        #         break
-        #
-        # # Phase 2: Freeze the encoder
-        # for param in self.model.subnets[self.task_id].encoder.parameters():
-        #     param.requires_grad = False
-        #
-        # loguru.logger.info(f"Optimizing on reconstruction loss on task {self.task_id}")
+
         for epoch in range(0, self.args.n_epochs):
 
-            self.train_current_task(self.args, self.model, self.dataloader, epoch) # , optimize='reconstruction'
+            self.train_current_task(self.args, self.model, self.dataloader, epoch)
 
             print("<< Evaluating the current training >> ")
             val_loss, val_acc, val_rec_loss = self.eval_current_task(self.args, self.model,
@@ -181,12 +161,10 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
                 tag_loss_val = f'Loss/validation_loss'
                 tag_acc_val = f'Accuracy/validation_accuracy'
                 tag_ce_loss_train = f'Loss/ce_loss'
-                tag_reconstruction_loss_train = f'Loss/reconstruction_loss'
                 tag_acc_train = f'Accuracy/train_accuracy'
 
                 self.wandb.log({tag_loss_val: val_loss, tag_acc_val: val_acc,
                                 tag_ce_loss_train: self.ce_loss, tag_acc_train: self.train_acc,
-                                tag_reconstruction_loss_train: self.reconstruction_loss,
                                 "epoch": epoch})
 
             # Early stopping, val_rec_loss
@@ -228,7 +206,7 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
             targets = targets.to(self.args.device)
 
             # Given task_id=u for debugging
-            best_net_id, outputs = self.model(images, task_id=None)
+            outputs = self.model(images, task_id=None, compare_method=self.compare_method)
 
             loss = self.cross_entropy(outputs, targets)
 
@@ -250,8 +228,7 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         print('Average accuracy={:5.1f}%'.format(test_acc))
 
         output_path = f'/home/luu/projects/cl_selective_nets/results/{self.args.dataset}_' \
-                      f'DISN_task-agnostic_{self.args.reconstruction_loss}reconstruction_score_' \
-                      f'{self.args.latent_dim}-latent-dim_{self.args.size}-image-size.txt'
+                      f'{self.args.cl_strategy}_{self.args.size}-image-size_{self.k}-mem.txt'
         print('Save at ' + output_path)
         np.savetxt(output_path, self.acc, '%.4f')
 
@@ -275,13 +252,13 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         total_loss = []
         total_acc = []
 
-        for batch_idx, (images, targets) in enumerate(stream_dataloader): # , _
+        for batch_idx, (images, targets) in enumerate(stream_dataloader):  # , _
             # self.model.to(self.args.device)
             images = images.to(self.args.device)
             targets = targets.to(self.args.device)
 
             # Given task_id=u for debugging
-            best_net_id, outputs = self.model(images, task_id=None)
+            outputs = self.model(images, task_id=None, compare_method=self.compare_method)
 
             loss = self.cross_entropy(outputs, targets)
 
@@ -303,8 +280,8 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         print('Average accuracy={:5.1f}%'.format(test_acc))
 
         output_path = f'/home/luu/projects/cl_selective_nets/results/{self.args.dataset}_' \
-                      f'DISN_task-agnostic_{self.args.reconstruction_loss}reconstruction_score_' \
-                      f'{self.args.latent_dim}-latent-dim_{self.args.size}-image-size.txt'
+                      f'{self.args.cl_strategy}_{self.args.size}-image-size_{self.k}-mem.txt'
+
         print('Save at ' + output_path)
         np.savetxt(output_path, self.acc, '%.4f')
 
@@ -315,14 +292,12 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
             self.wandb.log({tag_val_task_agnostic_loss: test_loss,
                             tag_val_task_agnostic_acc: test_acc})
 
-    def train_current_task(self, args, model, trainloader, epoch, optimize='classification'):
+    def train_current_task(self, args, model, trainloader, epoch):
         print('\nEpoch: %d' % epoch)
         model.train()
         train_ce_loss = 0
-        train_reconstruction_loss = 0
         correct = 0
         total = 0
-        total_ssim = 0
         for batch_idx, data in enumerate(trainloader):
             inputs, targets, taskid_targets = data
 
@@ -330,54 +305,25 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
 
             # Forward current model
             # print(taskid_targets) taskid_targets[0]
-            reconstructed_img, outputs = self.model(inputs, task_id=self.task_id)
+            outputs = self.model(inputs, task_id=self.task_id)
 
             ce_loss = self.cross_entropy(outputs, targets)
 
-            if self.args.reconstruction_loss == 'mse':
-                reconstruction_loss = F.mse_loss(inputs, reconstructed_img, reduction="none")
-                reconstruction_loss = reconstruction_loss.sum(dim=[1, 2, 3]).mean(dim=[0])
-
-            elif self.args.reconstruction_loss == 'perceptual_loss':
-                reconstruction_loss = self.perceptual_loss(reconstructed_img, inputs)
-            else:
-                raise NotImplementedError("Reconstruction image loss function is not implemented!")
-
-            ssim_score = ssim(inputs.float(), reconstructed_img.float(), data_range=1, size_average=True)
-
-            lamda = 0.5
-            total_loss = (1 - lamda) * reconstruction_loss + lamda * ce_loss
-
-            # if optimize == 'classification':
-            #     total_loss = ce_loss
-            # elif optimize == 'reconstruction':
-            #     total_loss = reconstruction_loss
-            # else:
-            #     raise Exception("Unknown optimization")
-
-            # print('loss = ', modified_ce_loss)
-            # Backward
             self.optimizer.zero_grad()
-            total_loss.backward()
+            ce_loss.backward()
             self.optimizer.step()
 
             train_ce_loss += ce_loss.item()
-            train_reconstruction_loss += reconstruction_loss.item()
-            total_ssim += ssim_score.item()
 
             # Accuracy
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            progress_bar(batch_idx, len(trainloader), 'CE Loss: %.3f | Reconstruction Loss: %.3f '
-                                                      '| SSIM: %.3f | Acc: %.3f%% (%d/%d)'
-                         % (train_ce_loss / (batch_idx + 1), train_reconstruction_loss / (batch_idx + 1),
-                            total_ssim/(batch_idx+1),
-                            100. * correct / total, correct, total))
+            progress_bar(batch_idx, len(trainloader), 'CE Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                         % (train_ce_loss / (batch_idx + 1), 100. * correct / total, correct, total))
 
         self.ce_loss = train_ce_loss / (batch_idx + 1)
-        self.reconstruction_loss = train_reconstruction_loss / (batch_idx + 1)
         self.train_acc = 100. * correct / total
 
     def eval_current_task(self, args, model, val_loader, test_task_id=None):
@@ -409,38 +355,26 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
                 task = torch.autograd.Variable(torch.LongTensor([current_task]).cuda())
 
                 # Original code, not have return task id
-                reconstructed_img, outputs = self.model(inputs, task)
+                outputs = self.model(inputs, task_id=task)
 
                 # # Trying to make task ID predictions
                 # pred_taskid, outputs = self.model(inputs, task, return_experts=False, return_task_pred=True)
                 # print(torch.argmax(pred_taskid).item())
                 loss = self.cross_entropy(outputs, targets)
 
-                if self.args.reconstruction_loss == 'mse':
-                    reconstruction_loss = F.mse_loss(inputs, reconstructed_img, reduction="none")
-                    reconstruction_loss = reconstruction_loss.sum(dim=[1, 2, 3]).mean(dim=[0])
-
-                elif self.args.reconstruction_loss == 'perceptual_loss':
-                    reconstruction_loss = self.perceptual_loss(reconstructed_img, inputs)
-
-                ssim_score = ssim(inputs.float(), reconstructed_img.float(), data_range=1, size_average=True)
-
-                val_reconstruction_loss += reconstruction_loss.item()
                 test_loss += loss.item()
-                total_ssim += ssim_score.item()
+
                 _, predicted = outputs.max(1)
                 total += targets.size(0)
                 correct += predicted.eq(targets).sum().item()
 
                 total_loss.append(test_loss / (batch_idx + 1))
                 total_acc.append(100. * correct / total)
-                total_rec_loss.append(val_reconstruction_loss/(batch_idx+1))
+                total_rec_loss.append(val_reconstruction_loss / (batch_idx + 1))
 
-                progress_bar(batch_idx, len(val_loader), 'CE Loss: %.3f | Reconstruction Loss: %.3f | SSIM: %.3f | Acc: %.3f%% (%d/%d)'
-                             % (test_loss / (batch_idx + 1),
-                                val_reconstruction_loss / (batch_idx + 1),
-                                total_ssim/(batch_idx+1),
-                                100. * correct / total, correct, total))
+                progress_bar(batch_idx, len(val_loader),
+                             'CE Loss: %.3f | Acc: %.3f%% (%d/%d)'
+                             % (test_loss / (batch_idx + 1), 100. * correct / total, correct, total))
 
         return np.average(total_loss), np.average(total_acc), np.average(total_rec_loss)
 
@@ -515,10 +449,8 @@ class DynamicIntegratedContinualLearningWithSubnets(SupervisedTemplate):
         return image
 
 
-def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
-
+def cl_reminder(args, real_dataset, distilled_dataset):
     if args.use_wandb is True:
-
         wandb.login(key='1bed216d1f9c32afa692155d2e0911cd750f41dd')
 
         config = dict(
@@ -553,10 +485,6 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
                                                                                 train_path=train_path,
                                                                                 val_path=test_path)
 
-    # Get distilled dataset
-    distilled_datasets_train, distilled_datasets_test = torch.utils.data.random_split(distilled_dataset,
-                                                                                      lengths=[0.9, 0.1])
-
     from avalanche.benchmarks import nc_benchmark, ni_benchmark
 
     seed = 5
@@ -587,30 +515,28 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
     else:
         raise NotImplementedError(f"This scenario {args.scenario} is not implemented")
 
-    # # Get balanced subset
-    # balanced_subset = sample_subset(train_dataset, images_per_class=10)
-
-    if args.reconstruction_loss == 'perceptual_loss':
-        perceptual_loss_func = perceptual_loss.PerceptualLoss().to('cuda') if args.device else \
-            perceptual_loss.PerceptualLoss()
-
-    else:
-        perceptual_loss_func = None
+    # Get memory
+    k = 5
+    loguru.logger.info(f"Loading memories: {k} images / class")
+    # train_dataset, distilled_dataset
+    memories, extract_feature_model = get_memories(args, train_dataset, k=k)
 
     # latent_dim = 256, 384 (best), 512
-    model = AE.AEWithSelectiveSubnets(args=args, base_channel_size=args.size, latent_dim=args.latent_dim,
-                                      num_child_models=args.n_experience,
-                                      num_classes=args.nb_classes, width=args.size, height=args.size,
-                                      perceptual_loss=perceptual_loss_func)
+    task_id_mapping = real_dataset_exps.original_classes_in_exp
+    model = resnet.Resnet50WithSelectiveSubnets(args=args,
+                                                model_dinov2=extract_feature_model,
+                                                distilled_feature_dict=memories, num_classes=args.nb_classes,
+                                                num_child_models=args.n_experience,
+                                                task_id_mapping=task_id_mapping)
 
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
     # Get strategy
-    strategy = DynamicIntegratedContinualLearningWithSubnets(args=args, model=model, optimizer=optimizer,
-                                                             test_entire_dataset=test_dataset,
-                                                             eval_stream=real_dataset_exps.test_stream,
-                                                             wandb=wandb if args.use_wandb is True else None,
-                                                             perceptual_loss_func=perceptual_loss_func)
+    strategy = CL_reminder(args=args, model=model, optimizer=optimizer, memories=memories,
+                           test_entire_dataset=test_dataset,
+                           eval_stream=real_dataset_exps.test_stream,
+                           wandb=wandb if args.use_wandb is True else None,
+                           k=k)
 
     # for task_id, real_experience in enumerate(real_dataset_exps.train_stream):
     #     print('classes in train stream', real_experience.classes_in_this_experience)
@@ -626,10 +552,10 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
             strategy.eval_agnostic_cifar10()
         else:
             strategy.eval_agnostic_core50()
-
-        # if task_id == 4:
-        #     torch.save(strategy.stored_features, '/home/luu/projects/cl_selective_nets/results/features.pt'
-
+    #
+    #     # if task_id == 4:
+    #     #     torch.save(strategy.stored_features, '/home/luu/projects/cl_selective_nets/results/features.pt'
+    #
     torch.save(model.state_dict(), f'/home/luu/projects/cl_selective_nets/results'
                                    f'/{args.dataset}_DISN_task-agnostic_reconstruction_score.pt')
 
@@ -638,81 +564,70 @@ def DIWSN_task_predictive(args, real_dataset, distilled_dataset):
         wandb.finish()
 
 
-def test_pretrained_model(args, real_dataset):
+def get_memories(args, distilled_dataset, k, model='dinov2'):
 
-    # Get real train, val, and test dataset
-    train_dataset, val_dataset, test_dataset = real_dataset
+    if model == 'dinov2':
+        assert args.size // 14, 'Dinov2 requires image size that can be divided with patch size = 14'
 
-    model = AE.AEWithSelectiveSubnets(args=args, base_channel_size=args.size, latent_dim=args.latent_dim,
-                                      num_child_models=args.n_experience,
-                                      num_classes=args.nb_classes, width=args.size, height=args.size,
-                                      perceptual_loss=None)
+        extract_feature_model = dinov2.dinov2(model_size='s', with_register=False).to(args.device)
 
-    pretrained_path = f'/home/luu/projects/cl_selective_nets/results' \
-                      f'/{args.dataset}_DISN_task-agnostic_reconstruction_score.pt'
+    else:
+        raise NotImplemented("The extraction model is not defined")
 
-    model.load_state_dict(torch.load(pretrained_path))
+    # Check the image shape constraints
+    distilled_image_shape = distilled_dataset[0][0].shape[1]
 
-    rec_loss_range = {0: 3171, 1: 2729, 2: 2457, 3: 3016, 4: 2517}
-    classes_in_exps = {0: [1, 4], 1: [9, 6], 2: [3, 5], 3: [0, 2], 4: [8, 7]}
+    assert args.size == distilled_image_shape, 'The training image size is different to distilled image'
 
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
+    # Ensure the dataset is in a mutable structure like a list
+    if isinstance(distilled_dataset, list):
+        dataset_list = distilled_dataset
+    else:
+        dataset_list = list(distilled_dataset)  # This assumes the dataset can be iterated into a list
 
-    total_images = 0
-    correct_predictions = 0
+    dataset_list = dataset_list[:600]
+    # Shuffle the dataset
+    random.shuffle(dataset_list)
 
-    for data in test_loader:
-        image, label, _ = data
-        label = label.item()  # Assuming label is a tensor with a single value
-        closest_model = None
-        smallest_diff = float('inf')
+    class_images = {}
 
-        for idx, submodel in enumerate(model.subnets):
-            reconstructed_img, _ = submodel(image)
+    if args.dataset == 'core50':
+        # Collect up to k images per class
+        for image, label, task_id in dataset_list:
+            image = image.unsqueeze(0).to(args.device)
+            # label = label.item()
+            if label not in class_images:
+                class_images[label] = [extract_feature_model(image)]  # Start a new list for this class
+                # class_images[label] = [image]
+            elif len(class_images[label]) < k:
+                class_images[label].append(extract_feature_model(image))  # Add image to the list if it doesn't reach k yet
+                # class_images[label].append(image)
+            # Check if we have collected the required number of classes
+            enough_k = all(len(images) == k for images in class_images.values())
+            if len(class_images) == args.nb_classes and enough_k:
+                break
 
-            reconstruction_loss = F.mse_loss(image, reconstructed_img, reduction="none")
-            reconstruction_loss = reconstruction_loss.sum(dim=[1, 2, 3]).mean(dim=[0]).item()
+    # Core50 dataset has task_id
+    else:
+        # Collect up to k images per class
+        for image, label in dataset_list:
+            image = image.unsqueeze(0).to(args.device)
+            # label = label.item()
+            if label not in class_images:
+                class_images[label] = [extract_feature_model(image)]  # Start a new list for this class
+                # class_images[label] = [image]
+            elif len(class_images[label]) < k:
+                class_images[label].append(
+                    extract_feature_model(image))  # Add image to the list if it doesn't reach k yet
+                # class_images[label].append(image)
+            # Check if we have collected the required number of classes
+            enough_k = all(len(images) == k for images in class_images.values())
+            if len(class_images) == args.nb_classes and enough_k:
+                break
 
-            loss_diff = abs(rec_loss_range[idx] - reconstruction_loss)
-
-            if loss_diff < smallest_diff:
-                smallest_diff = loss_diff
-                closest_model = idx
-
-        threshold = 100  # This is adjustable
-        if smallest_diff <= threshold and label in classes_in_exps[closest_model]:
-            correct_predictions += 1
-        total_images += 1
-
-        if smallest_diff <= threshold:
-            print(
-                f"Image from batch closely matches model {closest_model} which includes classes {classes_in_exps[closest_model]}")
-        else:
-            print(f"No close reconstruction model found. Loss: {reconstruction_loss}, True label: {label}")
-
-    # Calculate accuracy
-    accuracy = (correct_predictions / total_images) * 100
-    print(f"Accuracy of correctly predicting experience based on reconstruction loss is {accuracy:.2f}%")
+    return class_images, extract_feature_model
 
 
 """
-python3 main_cl.py --n_epochs 5 --cl_strategy DI_with_task_predictive
-
-seed = 5
-python3 main_cl.py --dataset core50 --n_epochs 200 --latent_dim 128 --cl_strategy DI_with_task_predictive --lr 0.001 --use_wandb True
-
-seed = 6
-python3 main_cl.py --dataset cifar10 --n_epochs 30 --latent_dim 256 --cl_strategy DI_with_task_predictive --lr 0.001 --use_wandb false --reconstruction_loss perceptual_loss --AE_model ae_resnet18
-
-
-# Core50 50 classes - perceptual loss
-python3 main_cl.py --dataset core50 --n_epochs 200 --latent_dim 384 --n_experience 5 --obj_lvl true --nb_classes 50 --reconstruction_loss perceptual_loss --cl_strategy DI_with_task_predictive --lr 0.001 --use_wandb false
-
-
-# Intel images - perceptual loss - image size 224
-python3 main_cl.py --dataset intel_images --n_epochs 50 --latent_dim 128 --cl_strategy DI_with_task_predictive --lr 0.001 --use_wandb false --AE_model ae_resnet50_pretrained --size 224 --reconstruction_loss perceptual_loss --n_experience 3 --nb_classes 6
-
-# stl-10 dataset
-python3 main_cl.py --dataset stl_10 --n_epochs 90 --latent_dim 256 --cl_strategy DI_with_task_predictive --lr 0.001 --use_wandb false --reconstruction_loss perceptual_loss --AE_model ae_simple_cnn_pretrained --n_experience 5 --nb_classes 10 --size 32
-
+python3 main_cl.py --dataset core50 --size 224 --cl_strategy cl_reminder  
 """

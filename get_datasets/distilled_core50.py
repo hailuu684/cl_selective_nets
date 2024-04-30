@@ -3,26 +3,38 @@ import os
 from avalanche.benchmarks.utils import concat_datasets
 from torch.utils.data import Dataset
 from avalanche.benchmarks.utils import make_classification_dataset
+import torchvision.transforms as transforms
 
 
 class CustomDataset(Dataset):
-    def __init__(self, images, targets):
+    def __init__(self, images, targets, transform=None):
         self.images = images
         self.targets = targets
+        self.transform = transform
 
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, index):
         # Retrieve data and target for a given index
-        x = self.images[index]
+
+        if self.transform:
+            x = self.transform(self.images[index])
+        else:
+            x = self.images[index]
+
         y = self.targets[index]
 
         return x, y
 
 
-def get_distilled_core50():
+def get_distilled_core50(args, use_transform=False):
     root = '/home/luu/DistilledDataset_ContinualLearning/author_distilled_dataset/DatasetCondensation/result'
+
+    if use_transform:
+        transform_train = transforms.Compose([transforms.Resize((args.size, args.size), antialias=True)])
+    else:
+        transform_train = None
 
     datasets = []
     for i in range(0, 7):  # numbers from 1 to 7
@@ -33,7 +45,7 @@ def get_distilled_core50():
             data = torch.load(filepath)['data'][0]
             images, labels = data
 
-            dataset = CustomDataset(images, labels)
+            dataset = CustomDataset(images, labels, transform=transform_train)
             dataset = make_classification_dataset(dataset)
             datasets.append(dataset)
 
@@ -42,6 +54,6 @@ def get_distilled_core50():
 
 
 if __name__ == '__main__':
-    datasets = get_distilled_core50()
+    datasets = get_distilled_core50(args)
     print(len(datasets))
 

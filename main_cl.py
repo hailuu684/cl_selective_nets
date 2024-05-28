@@ -15,7 +15,7 @@ import time
 from train_epoch import train, test
 from randomaug import RandAugment
 from cl_strategy import LearningToPromptWithDistilled, DynamicIntegrated, DynamicIntegratedSubnets, \
-    DynamicIntegratedSubnetsTaskPredictive, DI_SubnetsTP_contrasitive, cl_reminder
+    DynamicIntegratedSubnetsTaskPredictive, DI_SubnetsTP_contrasitive, cl_reminder, cl_KAN
 
 
 def run_cl_strategy():
@@ -48,6 +48,18 @@ def run_cl_strategy():
     parser.add_argument('--size', default=128, type=int, help='size of image')
     parser.add_argument('--nb_classes', default=10, type=int, help='number of classes')
 
+    # Memory method
+    parser.add_argument('--get_mem_method', default='kmeans', type=str, help='method for getting memories')
+    parser.add_argument('--compare_method', default='knn', type=str,
+                        choices=['knn', 'correlation_based_distance', 'cosine_similarity'])
+
+    parser.add_argument('--compare_model', default='dinov2', type=str,
+                        choices=['dinov2', 'radio'])
+
+    parser.add_argument('--k', default=10, type=int, help='number of experiences')
+
+    parser.add_argument('--latent_dim', default=384, type=int, help='latent dimension: 128, 256, 384, 512')
+
     # Model parameters
     parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')  # resnets.. 1e-3, Vit..1e-4
     parser.add_argument('--resume', '-r', action='store_true', help='resume from checkpoint')
@@ -61,9 +73,6 @@ def run_cl_strategy():
     # Learning rate schedule parameters
     parser.add_argument('--sched', default='constant', type=str, metavar='SCHEDULER',
                         help='LR scheduler (default: "constant"')
-
-    # Image reconstruction
-    parser.add_argument('--latent_dim', default=384, type=int, help='latent dimension: 128, 256, 384, 512')
 
     # Wandb
     parser.add_argument('--use_wandb', default=False, type=str2bool, help='Use wandb or not')
@@ -116,7 +125,7 @@ def run_cl_strategy():
         #
         dataset_cl = None, None, None
 
-        distilled_datasets = distilled_core50.get_distilled_core50(args)
+        distilled_datasets = None
 
     elif args.dataset == 'stl_10':
         dataset_cl = stl_10.get_stl_10(args)
@@ -141,7 +150,11 @@ def run_cl_strategy():
         DI_SubnetsTP_contrasitive.DIWSN_task_predictive(args=args, real_dataset=None,
                                                         distilled_dataset=distilled_datasets)
     elif args.cl_strategy == 'cl_reminder':
+        # cl_reminder.get_memories_kmeans(args=args, real_dataset=dataset_cl, k=args.k)
+        cl_reminder.run_get_memories(args=args, real_dataset=dataset_cl, k=args.k, model=args.compare_model)
         cl_reminder.cl_reminder(args=args, real_dataset=dataset_cl, distilled_dataset=distilled_datasets)
+    elif args.cl_strategy == 'cl_kan':
+        cl_KAN.cl_kan(args=args, real_dataset=dataset_cl)
     else:
         raise NotImplemented("Strategy is not implemented yet")
 

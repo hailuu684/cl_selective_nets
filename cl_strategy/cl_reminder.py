@@ -19,6 +19,7 @@ import torch.nn.functional as F
 import wandb
 import torchvision
 import random
+
 try:
     from timm.models.helpers import (
         adapt_input_conv,
@@ -41,7 +42,7 @@ import sys
 from pytorch_msssim import ssim
 
 sys.path.append("../")
-from models import resnet, dinov2, model_utils
+from models import resnet, dinov2, model_utils, radio
 from train_epoch import train, test
 from randomaug import RandAugment
 from utils import progress_bar
@@ -61,12 +62,13 @@ class CL_reminder(SupervisedTemplate):
         super(CL_reminder, self).__init__(model=model, optimizer=optimizer, train_mb_size=32, eval_mb_size=32)
 
         # Memory parameters
+        # todo: can be modify here to add up features into memories over each experience
         self.memories = memories
 
         # Number of images in each label
         self.k = k
 
-        self.compare_method = 'correlation_based_distance'
+        self.compare_method = args.compare_method  # correlation_based_distance, knn, cosine_similarity
         loguru.logger.info(f"Compare method using: {self.compare_method}")
 
         # Loss function
@@ -106,6 +108,13 @@ class CL_reminder(SupervisedTemplate):
 
         # use wandb
         self.wandb = wandb
+        self.save_results_path = f"/home/luu/projects/cl_selective_nets/results/{self.args.dataset}_" \
+                                 f"{self.args.cl_strategy}_" \
+                                 f"{self.args.size}-img-size_{self.args.compare_method}-compare-method_{self.args.k}-k_" \
+                                 f"{self.args.get_mem_method}-mem-method_" \
+                                 f"{self.args.latent_dim}-latent-dim.txt"
+
+        # temporary store loss and acc
         self.ce_loss = 0
         self.val_loss = 0
 
@@ -227,10 +236,8 @@ class CL_reminder(SupervisedTemplate):
 
         print('Average accuracy={:5.1f}%'.format(test_acc))
 
-        output_path = f'/home/luu/projects/cl_selective_nets/results/{self.args.dataset}_' \
-                      f'{self.args.cl_strategy}_{self.args.size}-image-size_{self.k}-mem.txt'
-        print('Save at ' + output_path)
-        np.savetxt(output_path, self.acc, '%.4f')
+        print('Save at ' + self.save_results_path)
+        np.savetxt(self.save_results_path, self.acc, '%.4f')
 
         if self.wandb:
             tag_val_task_agnostic_loss = 'Agnostic-Loss'
@@ -279,11 +286,8 @@ class CL_reminder(SupervisedTemplate):
 
         print('Average accuracy={:5.1f}%'.format(test_acc))
 
-        output_path = f'/home/luu/projects/cl_selective_nets/results/{self.args.dataset}_' \
-                      f'{self.args.cl_strategy}_{self.args.size}-image-size_{self.k}-mem.txt'
-
-        print('Save at ' + output_path)
-        np.savetxt(output_path, self.acc, '%.4f')
+        print('Save at ' + self.save_results_path)
+        np.savetxt(self.save_results_path, self.acc, '%.4f')
 
         if self.wandb:
             tag_val_task_agnostic_loss = 'Agnostic-Loss'
@@ -472,9 +476,6 @@ def cl_reminder(args, real_dataset, distilled_dataset):
             entity='luutunghai'
         )
 
-    # Get real train, val, and test dataset
-    train_dataset, val_dataset, test_dataset = real_dataset
-
     # dataset intel_images
     # todo: dont understand why loading this dataset from main_cl doesn't work
     if args.dataset == 'intel_images':
@@ -484,6 +485,13 @@ def cl_reminder(args, real_dataset, distilled_dataset):
         train_dataset, val_dataset, test_dataset = intel_image.get_intel_images(args=args,
                                                                                 train_path=train_path,
                                                                                 val_path=test_path)
+
+        loguru.logger.info("Number of experience is 3 due to the number of classes are 6")
+        args.n_experience = 3
+
+    else:
+        # Get real train, val, and test dataset
+        train_dataset, val_dataset, test_dataset = real_dataset
 
     from avalanche.benchmarks import nc_benchmark, ni_benchmark
 
@@ -516,10 +524,44 @@ def cl_reminder(args, real_dataset, distilled_dataset):
         raise NotImplementedError(f"This scenario {args.scenario} is not implemented")
 
     # Get memory
-    k = 5
+    k = args.k
     loguru.logger.info(f"Loading memories: {k} images / class")
-    # train_dataset, distilled_dataset
-    memories, extract_feature_model = get_memories(args, train_dataset, k=k)
+
+    if args.get_mem_method == 'kmeans':
+        path = f"/home/luu/projects/cl_selective_nets/checkpoints/{args.dataset}-dataset_{k}-features.pt"
+        memories = torch.load(path, map_location=args.device)
+
+        model_size = 's'
+        with_register = False
+        extract_feature_model = dinov2.dinov2(model_size=model_size, with_register=with_register).to(args.device)
+
+    else:
+
+        # ## Pre-run to get memories to experience more cases since the limitations in GPUs
+        path = f"/home/luu/projects/cl_selective_nets/checkpoints/{args.dataset}_{args.cl_strategy}_" \
+               f"{args.size}-img-size_{args.compare_method}-compare-method_{args.k}-k_{args.get_mem_method}-mem-method_" \
+               f"{args.latent_dim}-latent-dim"
+
+        memories = torch.load(path, map_location=args.device)
+
+        if args.latent_dim == 384:
+            model_size = 's'
+        elif args.latent_dim == 784:
+            model_size = 'b'
+        elif args.latent_dim == 1024:
+            model_size = 'l'
+        else:
+            raise NotImplementedError("Latent dim is not correct!")
+
+        with_register = False
+
+        extract_feature_model = dinov2.dinov2(model_size=model_size, with_register=with_register)
+
+        # --------------------------------------------------------------------
+        # ## Not pre-run
+        # # train_dataset, distilled_dataset
+        # memories, extract_feature_model = get_memories(args, train_dataset, k=k,
+        #                                                model=args.compare_model)  # radio, dinov2
 
     # latent_dim = 256, 384 (best), 512
     task_id_mapping = real_dataset_exps.original_classes_in_exp
@@ -564,12 +606,67 @@ def cl_reminder(args, real_dataset, distilled_dataset):
         wandb.finish()
 
 
-def get_memories(args, distilled_dataset, k, model='dinov2'):
+def run_get_memories(args, real_dataset, k, model):
+    loguru.logger.info(f"Running getting memories on {args.dataset} with {k} features")
 
+    if args.dataset == 'intel_images':
+        train_path = '/home/luu/projects/datasets/intel-image-classification/seg_train/seg_train'
+        test_path = '/home/luu/projects/datasets/intel-image-classification/seg_test/seg_test'
+
+        train_dataset, val_dataset, test_dataset = intel_image.get_intel_images(args=args,
+                                                                                train_path=train_path,
+                                                                                val_path=test_path)
+
+        loguru.logger.info("Number of experience is 3 due to the number of classes are 6")
+        args.n_experience = 3
+
+    else:
+        # Get real train, val, and test dataset
+        train_dataset, val_dataset, test_dataset = real_dataset
+
+    memories, extract_feature_model = get_memories(args, train_dataset, k=k, model=model)  # radio, dinov2
+
+    path = f"/home/luu/projects/cl_selective_nets/checkpoints/{args.dataset}_{args.cl_strategy}_" \
+           f"{args.size}-img-size_{args.compare_method}-compare-method_{args.k}-k_{args.get_mem_method}-mem-method_" \
+           f"{args.latent_dim}-latent-dim"
+
+    # flash_memory = {'memories': memories, 'compare_model': extract_feature_model}
+
+    torch.save(memories, path)
+
+    print(f"saved {path}")
+
+
+def get_memories(args, distilled_dataset, k, model='dinov2', return_dim_compare_model=False):
     if model == 'dinov2':
         assert args.size // 14, 'Dinov2 requires image size that can be divided with patch size = 14'
 
-        extract_feature_model = dinov2.dinov2(model_size='s', with_register=False).to(args.device)
+        if args.latent_dim == 384:
+            model_size = 's'
+        elif args.latent_dim == 784:
+            model_size = 'b'
+        elif args.latent_dim == 1024:
+            model_size = 'l'
+        else:
+            raise NotImplementedError("Latent dim is not correct!")
+
+        with_register = False
+        extract_feature_model = dinov2.dinov2(model_size=model_size, with_register=with_register)
+
+        extract_feature_model.to(args.device)
+
+        loguru.logger.info(f"Compare model: Dino_v2 - Model size: {model_size} - With register: {with_register}")
+
+    elif model == 'radio':
+
+        valid_radio_model = ['radio_v2', 'e-radio_v2']
+
+        chosen_model = valid_radio_model[1]
+        latent_dim = 512
+
+        extract_feature_model = radio.radio_v2(args, desire_latent_dim=latent_dim, model_version=chosen_model)
+
+        loguru.logger.info(f"Compare model: Radio_v2 - version: {chosen_model}")
 
     else:
         raise NotImplemented("The extraction model is not defined")
@@ -585,7 +682,7 @@ def get_memories(args, distilled_dataset, k, model='dinov2'):
     else:
         dataset_list = list(distilled_dataset)  # This assumes the dataset can be iterated into a list
 
-    dataset_list = dataset_list[:600]
+    dataset_list = dataset_list[:(k * args.nb_classes * 5)]
     # Shuffle the dataset
     random.shuffle(dataset_list)
 
@@ -600,7 +697,8 @@ def get_memories(args, distilled_dataset, k, model='dinov2'):
                 class_images[label] = [extract_feature_model(image)]  # Start a new list for this class
                 # class_images[label] = [image]
             elif len(class_images[label]) < k:
-                class_images[label].append(extract_feature_model(image))  # Add image to the list if it doesn't reach k yet
+                class_images[label].append(
+                    extract_feature_model(image))  # Add image to the list if it doesn't reach k yet
                 # class_images[label].append(image)
             # Check if we have collected the required number of classes
             enough_k = all(len(images) == k for images in class_images.values())
@@ -625,9 +723,99 @@ def get_memories(args, distilled_dataset, k, model='dinov2'):
             if len(class_images) == args.nb_classes and enough_k:
                 break
 
+    if return_dim_compare_model:
+        return class_images, extract_feature_model, latent_dim
+
     return class_images, extract_feature_model
+
+
+def extract_features(model, dataset, device, dataset_name):
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+    model.eval()
+    features = []
+    labels = []
+    with torch.no_grad():
+        if dataset_name == 'core50':
+            for images, target, _ in dataloader:
+                images = images.to(device)
+                output = model(images)
+                features.append(output.cpu())
+                labels.append(target)
+        else:
+            for images, target in dataloader:
+                images = images.to(device)
+                output = model(images)
+                features.append(output.cpu())
+                labels.append(target)
+    features = torch.cat(features)
+    labels = torch.cat(labels)
+    return features, labels
+
+
+def kmeans_clustering(features, num_clusters, k):
+    from sklearn.cluster import KMeans
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42)
+    kmeans.fit(features)
+    centroids = kmeans.cluster_centers_
+    labels = kmeans.labels_
+
+    closest_images = {}
+    for i in range(num_clusters):
+        indices = np.where(labels == i)[0]
+        cluster_features = features[indices]
+        centroid = centroids[i].reshape(1, -1)
+        distances = np.linalg.norm(cluster_features - centroid, axis=1)
+        closest_indices = indices[np.argsort(distances)[:k]]
+        closest_images[i] = closest_indices
+    return closest_images
+
+
+def get_memories_kmeans(args, real_dataset, k):
+    loguru.logger.info(f"Running K-means to get most closest features to "
+                       f"its centroid on {args.dataset} with {k} closest features")
+    # Get real train, val, and test dataset
+    train_dataset, val_dataset, test_dataset = real_dataset
+
+    run_kmeans(args, train_dataset, k=k, model='dinov2')
+
+
+def run_kmeans(args, distilled_dataset, k, model='dinov2'):
+    # Model setup
+    if model == 'dinov2':
+        assert args.size % 14 == 0, 'Dinov2 requires image size that can be divided with patch size = 14'
+        model_size = 's'
+        with_register = False
+        extract_feature_model = dinov2.dinov2(model_size=model_size, with_register=with_register).to(args.device)
+        loguru.logger.info(f"Compare model: Dino_v2 - Model size: {model_size} - With register: {with_register}")
+    elif model == 'radio':
+        valid_radio_model = ['radio_v2', 'e-radio_v2']
+        chosen_model = valid_radio_model[1]
+        extract_feature_model = radio.radio_v2(args, desire_latent_dim=512, model_version=chosen_model)
+        loguru.logger.info(f"Compare model: Radio_v2 - version: {chosen_model}")
+    else:
+        raise NotImplementedError("The extraction model is not defined")
+
+    features, labels = extract_features(extract_feature_model, distilled_dataset, device=args.device,
+                                        dataset_name=args.dataset)
+    features_np = features.numpy()
+
+    closest_images = kmeans_clustering(features_np, num_clusters=args.nb_classes, k=k)
+
+    closest_features = {}
+    for class_idx, indices in closest_images.items():
+        closest_features[class_idx] = [extract_feature_model(distilled_dataset[i][0].unsqueeze(0).to(args.device)) for i
+                                       in indices]
+
+    # Save the closest features
+    torch.save(closest_features,
+               f"/home/luu/projects/cl_selective_nets/checkpoints/{args.dataset}-dataset_{k}-features.pt")
+
+    return closest_features
 
 
 """
 python3 main_cl.py --dataset core50 --size 224 --cl_strategy cl_reminder  
+
+ python3 main_cl.py --dataset core50 --size 140 --cl_strategy cl_reminder --compare_method knn --compare_model dinov2 --k 10 --get_mem_method else
+
 """

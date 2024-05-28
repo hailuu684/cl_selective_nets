@@ -7,11 +7,13 @@ import torch.nn.functional as F
 import torchvision.models as torch_models
 from torchvision import models
 import numpy as np
+from models.knn import knn_classify
+
+
 # ------------------------------  RESNET 18 FOR UPPER BOUND--------------------------------- #
 
 
 def resnet50(pretrained=True, num_classes=10):
-
     if pretrained:
         model = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2)
     else:
@@ -29,7 +31,8 @@ def resnet50(pretrained=True, num_classes=10):
 
 
 class Resnet50WithSelectiveSubnets(nn.Module):
-    def __init__(self, args, model_dinov2, distilled_feature_dict, task_id_mapping, num_classes=10, num_child_models=5):
+    def __init__(self, args, model_dinov2, distilled_feature_dict, task_id_mapping,
+                 num_classes=10, num_child_models=5):
         super().__init__()
 
         self.args = args
@@ -39,6 +42,11 @@ class Resnet50WithSelectiveSubnets(nn.Module):
         self.subnets = nn.ModuleList([resnet50(num_classes=num_classes) for _ in range(num_child_models)])
 
         self.features = None
+
+        # Our experiments have the following features in each key: 1, 10, 20
+        # So if each key has 1 feature, then using k = 1
+        self.k = 5 if len(distilled_feature_dict.get('distilled', [])) > 5 else 1
+
     def forward(self, image, compare_method=None, task_id=None):
 
         if task_id is not None and compare_method is None:
@@ -48,7 +56,15 @@ class Resnet50WithSelectiveSubnets(nn.Module):
 
         elif task_id is None:
 
-            predicted_task_id = self.compare_features(image, compare_method=compare_method)
+            if compare_method == 'knn':
+
+                predicted_logit = knn_classify(image, embeddings_dict=self.distilled_feature_dict,
+                                               model=self.model_dinov2, K=self.k)
+
+                predicted_task_id = self.find_label_index(predicted_logit, self.task_id_mapping)
+                # loguru.logger.info("Using Knn for predicting task id")
+            else:
+                predicted_task_id = self.compare_features(image, compare_method=compare_method)
 
             logits = self.subnets[predicted_task_id](image)
 
@@ -76,7 +92,8 @@ class Resnet50WithSelectiveSubnets(nn.Module):
             elif compare_method == 'euclidean_distance':
                 similarities = [self.euclidean_distance(test_features, feature).item() for feature in self.features]
             elif compare_method == 'correlation_based_distance':
-                similarities = [self.correlation_based_distance(test_features, feature).item() for feature in self.features]
+                similarities = [self.correlation_based_distance(test_features, feature).item() for feature in
+                                self.features]
             else:
                 raise NotImplemented("Compare method is not implemented")
 
@@ -119,6 +136,7 @@ class Resnet50WithSelectiveSubnets(nn.Module):
 
     def correlation_based_distance(self, tensor1, tensor2):
         errors = 1 - np.corrcoef(tensor1.detach().cpu().numpy(), tensor2.detach().cpu().numpy())[0, 1]
+        # errors = 1 - np.corrcoef(tensor1.detach().cpu().numpy(), tensor2)[0, 1]
 
         return errors
 
@@ -234,7 +252,7 @@ class ResNet18Enc(nn.Module):
 
 class ResNet18Dec(nn.Module):
 
-    def __init__(self, num_Blocks=[2,2,2,2], z_dim=10, nc=3):
+    def __init__(self, num_Blocks=[2, 2, 2, 2], z_dim=10, nc=3):
         super().__init__()
         self.in_planes = 512
 
@@ -250,7 +268,7 @@ class ResNet18Dec(nn.Module):
         self.adaptive_pool = nn.AdaptiveAvgPool2d((32, 32))
 
     def _make_layer(self, BasicBlockDec, planes, num_Blocks, stride):
-        strides = [stride] + [1]*(num_Blocks-1)
+        strides = [stride] + [1] * (num_Blocks - 1)
         layers = []
         for stride in reversed(strides):
             layers += [BasicBlockDec(self.in_planes, stride)]
@@ -368,10 +386,10 @@ class BasicBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(planes)
 
         self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion*planes:
+        if stride != 1 or in_planes != self.expansion * planes:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
             )
 
     def forward(self, x):
@@ -396,7 +414,7 @@ class ResNet9(nn.Module):
         self.fc = nn.Linear(512, num_classes, bias=False)
 
     def _make_layer(self, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
+        strides = [stride] + [1] * (num_blocks - 1)
         layers = []
         for stride in strides:
             layers.append(BasicBlock(self.in_planes, planes, stride))
@@ -413,6 +431,3 @@ class ResNet9(nn.Module):
         out = out.view(out.size(0), -1)
         out = self.fc(out)
         return out
-
-
-
